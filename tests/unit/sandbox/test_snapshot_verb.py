@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import json
 from collections import namedtuple
+from collections.abc import MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from aios.config import get_settings
 from aios.models.environments import UnrestrictedNetworking
+from aios.sandbox import snapshot_telemetry
+from aios.sandbox.backends import docker as docker_backend
 from aios.sandbox.backends.base import (
     INSTANCE_LABEL_KEY,
     MANAGED_LABEL_KEY,
@@ -1355,17 +1359,18 @@ class TestUninspectableBase:
         assert out.unique_bytes > 0, "and the session must not be accounted free meanwhile"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("budget", [None, 4 * GIB], ids=["no_budget", "default_budget"])
-    async def test_absent_base_does_not_flatten(
-        self, fake_docker: _FakeDocker, budget: int | None
+    async def test_absent_base_does_not_flatten_without_a_budget(
+        self, fake_docker: _FakeDocker
     ) -> None:
+        """Dead history stays off on an absent base; with no budget configured
+        nothing else fires (a budgeted absent base is #2538 N1, below)."""
         self._setup(
             fake_docker, parent_view=2 * GB + 10 * 1000**2, parent_chain=6 * GB + 20 * 1000**2
         )
         del fake_docker.images[self.BASE_REF]  # inspect -> "No such image"
 
         out = await DockerBackend().snapshot(
-            "cid", "tag:latest", empty_floor_bytes=8192, flatten_if_unique_bytes_over=budget
+            "cid", "tag:latest", empty_floor_bytes=8192, flatten_if_unique_bytes_over=None
         )
 
         assert out.kind == "committed"
@@ -1425,6 +1430,345 @@ class TestUninspectableBase:
         )
 
         assert out.kind == "flattened"
+
+
+class TestUnknownBaseByteBound:
+    """#2538 N1: with an uninspectable base the budget saw only ``rw``, so the
+    200-layer depth ceiling was the only bound — on layer COUNT, not bytes.
+    Reproduction: absent base, a 500 GB parent chain at depth 150 and a 4 GiB
+    budget committed; only depth 199 flattened."""
+
+    BASE_REF = "base:latest"
+
+    @classmethod
+    def _setup(cls, fake_docker: _FakeDocker, *, parent_view: int, parent_chain: int) -> None:
+        fake_docker.images[cls.BASE_REF] = {
+            "id": "base_img",
+            "size": 2 * GB,
+            "chain": 6 * GB,
+            "depth": 8,
+            "labels": {},
+        }
+        fake_docker.parent_image = "img_S1"
+        fake_docker.images["img_S1"] = {
+            "id": "img_S1",
+            "size": parent_view,
+            "chain": parent_chain,
+            "depth": 150,
+            "labels": {"aios.base_image": cls.BASE_REF},
+        }
+        fake_docker.container_labels = {"aios.base_image": cls.BASE_REF}
+        fake_docker.size_rw = 1_000_000
+
+    @pytest.mark.asyncio
+    async def test_verified_absent_base_charges_the_full_parent_to_the_budget(
+        self, fake_docker: _FakeDocker
+    ) -> None:
+        """The reviewer's reproduction: a VERIFIED "No such image" base is not
+        coming back, so the budget is charged ``parent.best`` and flattens."""
+        self._setup(fake_docker, parent_view=20 * GB, parent_chain=500 * GB)
+        del fake_docker.images[self.BASE_REF]
+
+        out = await DockerBackend().snapshot(
+            "cid", "tag:latest", empty_floor_bytes=8192, flatten_if_unique_bytes_over=4 * GIB
+        )
+
+        assert out.kind == "flattened"
+
+    @pytest.mark.asyncio
+    async def test_verified_absent_base_over_counts_a_modest_parent(
+        self, fake_docker: _FakeDocker
+    ) -> None:
+        """Over-count on verified absence: a 6 GB chain over a 4 GiB budget
+        flattens, as it did on master before #2388 (missing base == 0)."""
+        self._setup(fake_docker, parent_view=2 * GB, parent_chain=6 * GB)
+        del fake_docker.images[self.BASE_REF]
+
+        out = await DockerBackend().snapshot(
+            "cid", "tag:latest", empty_floor_bytes=8192, flatten_if_unique_bytes_over=4 * GIB
+        )
+
+        assert out.kind == "flattened"
+
+    @pytest.mark.asyncio
+    async def test_transient_base_error_flattens_past_the_byte_backstop(
+        self, fake_docker: _FakeDocker
+    ) -> None:
+        """An INDETERMINATE base keeps the rw-only projection, but a parent
+        chain beyond N x the budget flattens — no shared base explains that."""
+        self._setup(fake_docker, parent_view=20 * GB, parent_chain=500 * GB)
+        fake_docker.inspect_errors[self.BASE_REF] = b"Error response from daemon: i/o timeout"
+
+        out = await DockerBackend().snapshot(
+            "cid", "tag:latest", empty_floor_bytes=8192, flatten_if_unique_bytes_over=4 * GIB
+        )
+
+        assert out.kind == "flattened"
+
+    @pytest.mark.asyncio
+    async def test_transient_base_error_below_the_backstop_commits(
+        self, fake_docker: _FakeDocker
+    ) -> None:
+        """Under the backstop a transient base error still commits: a guess
+        must not buy a flatten (the F1 guard in TestUninspectableBase)."""
+        multiple = docker_backend._UNKNOWN_BASE_BUDGET_MULTIPLE
+        self._setup(fake_docker, parent_view=2 * GB, parent_chain=multiple * 4 * GIB - GB)
+        fake_docker.inspect_errors[self.BASE_REF] = b"Error response from daemon: i/o timeout"
+
+        out = await DockerBackend().snapshot(
+            "cid", "tag:latest", empty_floor_bytes=8192, flatten_if_unique_bytes_over=4 * GIB
+        )
+
+        assert out.kind == "committed"
+        assert not fake_docker.pipelines
+
+    @pytest.mark.asyncio
+    async def test_no_budget_never_flattens_on_bytes(self, fake_docker: _FakeDocker) -> None:
+        self._setup(fake_docker, parent_view=20 * GB, parent_chain=500 * GB)
+        fake_docker.inspect_errors[self.BASE_REF] = b"Error response from daemon: i/o timeout"
+
+        out = await DockerBackend().snapshot(
+            "cid", "tag:latest", empty_floor_bytes=8192, flatten_if_unique_bytes_over=None
+        )
+
+        assert out.kind == "committed"
+
+
+class TestVanishedParent:
+    """#2538 N2: the parent inspected fine but its cost probe then failed (the
+    image vanished, or the daemon errored). It must be known by the VIEW it
+    presented — not dropped to 0, which would zero the session-added chain and
+    silence the budget."""
+
+    @pytest.mark.asyncio
+    async def test_parent_cost_vanishing_falls_back_to_its_view(
+        self, fake_docker: _FakeDocker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_docker.images["base:latest"] = {
+            "id": "base_img",
+            "size": 2 * GB,
+            "chain": 2 * GB,
+            "depth": 4,
+            "labels": {},
+        }
+        fake_docker.parent_image = "img_S1"
+        fake_docker.images["img_S1"] = {
+            "id": "img_S1",
+            "size": 10 * GB,
+            "chain": 10 * GB,
+            "depth": 16,
+            "labels": {"aios.base_image": "base:latest"},
+        }
+        fake_docker.container_labels = {"aios.base_image": "base:latest"}
+        backend = DockerBackend()
+        real_cost = backend.image_disk_cost
+
+        async def _cost(image: str) -> Any:
+            if image == "img_S1":
+                raise SandboxBackendError("image not found: img_S1")
+            return await real_cost(image)
+
+        monkeypatch.setattr(backend, "image_disk_cost", _cost)
+
+        out = await backend.snapshot(
+            "cid", "tag:latest", empty_floor_bytes=8192, flatten_if_unique_bytes_over=4 * GIB
+        )
+
+        # View-only: 10 GB parent view - 2 GB base view = 8 GB added > 4 GiB.
+        assert out.kind == "flattened"
+
+
+class TestChainAccountingDegradationTelemetry:
+    """#2538 N3: degraded probes are counted, and a consecutive streak alarms."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self) -> Any:
+        snapshot_telemetry.reset()
+        yield
+        snapshot_telemetry.reset()
+
+    @staticmethod
+    def _image(fake_docker: _FakeDocker) -> None:
+        fake_docker.images["img_S1"] = {
+            "id": "img_S1",
+            "size": 6 * GB,
+            "chain": 20 * GB,
+            "depth": 3,
+            "labels": {},
+        }
+
+    @pytest.mark.asyncio
+    async def test_unparseable_history_is_counted_and_alarms_on_a_streak(
+        self, fake_docker: _FakeDocker
+    ) -> None:
+        self._image(fake_docker)
+        fake_docker.history_output["img_S1"] = b"N/A\nN/A\nN/A\n"
+        backend = DockerBackend()
+
+        with capture_logs() as logs:
+            for _ in range(snapshot_telemetry.ALERT_STREAK + 2):
+                await backend.image_disk_cost("img_S1")
+
+        assert snapshot_telemetry.degraded_total("history_unparseable") == (
+            snapshot_telemetry.ALERT_STREAK + 2
+        )
+        alarms = [e for e in logs if e["event"] == "sandbox.chain_accounting_degraded_alarm"]
+        assert len(alarms) == 1, "one alarm per streak, not a flood"
+        assert alarms[0]["alarm_event"] is True
+        assert alarms[0]["reason"] == "history_unparseable"
+        assert alarms[0]["log_level"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_a_successful_measurement_resets_the_streak(
+        self, fake_docker: _FakeDocker
+    ) -> None:
+        self._image(fake_docker)
+        fake_docker.history_output["img_S1"] = b"N/A\n"
+        backend = DockerBackend()
+        for _ in range(snapshot_telemetry.ALERT_STREAK - 1):
+            await backend.image_disk_cost("img_S1")
+        del fake_docker.history_output["img_S1"]
+        await backend.image_disk_cost("img_S1")
+
+        assert snapshot_telemetry.degraded_streak("history_unparseable") == 0
+        assert snapshot_telemetry.degraded_total("history_unparseable") == (
+            snapshot_telemetry.ALERT_STREAK - 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_history_unavailable_is_counted(self, fake_docker: _FakeDocker) -> None:
+        self._image(fake_docker)
+        fake_docker.history_fails.add("img_S1")
+
+        await DockerBackend().image_disk_cost("img_S1")
+
+        assert snapshot_telemetry.degraded_total("history_unavailable") == 1
+
+    @pytest.mark.asyncio
+    async def test_base_unmeasurable_is_counted_and_alarms(self, fake_docker: _FakeDocker) -> None:
+        fake_docker.parent_image = "img_S1"
+        fake_docker.images["img_S1"] = {
+            "id": "img_S1",
+            "size": GB,
+            "depth": 4,
+            "labels": {"aios.base_image": "base:latest"},
+        }
+        fake_docker.container_labels = {"aios.base_image": "base:latest"}
+        fake_docker.inspect_errors["base:latest"] = b"Error response from daemon: i/o timeout"
+
+        with capture_logs() as logs:
+            for i in range(snapshot_telemetry.ALERT_STREAK):
+                await DockerBackend().snapshot(
+                    "cid", f"tag:{i}", empty_floor_bytes=8192, flatten_if_unique_bytes_over=None
+                )
+
+        assert snapshot_telemetry.degraded_total("base_unmeasurable") == (
+            snapshot_telemetry.ALERT_STREAK
+        )
+        assert any(
+            e["event"] == "sandbox.chain_accounting_degraded_alarm"
+            and e["reason"] == "base_unmeasurable"
+            for e in logs
+        )
+
+    @staticmethod
+    def _alarms(logs: Sequence[MutableMapping[str, Any]]) -> list[MutableMapping[str, Any]]:
+        return [e for e in logs if e["event"] == "sandbox.chain_accounting_degraded_alarm"]
+
+    @staticmethod
+    def _base_and_parent(fake_docker: _FakeDocker) -> None:
+        fake_docker.images["base:latest"] = {
+            "id": "base_img",
+            "size": 2 * GB,
+            "chain": 6 * GB,
+            "depth": 3,
+            "labels": {},
+        }
+        fake_docker.parent_image = "img_S1"
+        fake_docker.images["img_S1"] = {
+            "id": "img_S1",
+            "size": 3 * GB,
+            "chain": 9 * GB,
+            "depth": 5,
+            "labels": {"aios.base_image": "base:latest"},
+        }
+        fake_docker.container_labels = {"aios.base_image": "base:latest"}
+
+    @pytest.mark.asyncio
+    async def test_one_images_persistent_failure_alarms_despite_sibling_successes(
+        self, fake_docker: _FakeDocker
+    ) -> None:
+        """#2545 F1 probe A: the base's history never parses while the parent's
+        does. A sibling image's success must not reset the base's streak."""
+        self._base_and_parent(fake_docker)
+        fake_docker.history_output["base_img"] = b"N/A\nN/A\nN/A\n"
+        backend = DockerBackend()
+        with capture_logs() as logs:
+            for i in range(20):
+                await backend.snapshot(
+                    "cid", f"tag:{i}", empty_floor_bytes=8192, flatten_if_unique_bytes_over=None
+                )
+        assert snapshot_telemetry.degraded_total("history_unparseable") >= 20
+        assert self._alarms(logs), "base unparseable on 20/20 snapshots yet no alarm"
+
+    @pytest.mark.asyncio
+    async def test_fleetwide_failure_alarms_with_a_warm_chain_cache(
+        self, fake_docker: _FakeDocker
+    ) -> None:
+        """#2545 F1 probe B: base chain cached before a renderer change; every new
+        image is unparseable. Cache hits are not measurements."""
+        self._base_and_parent(fake_docker)
+        backend = DockerBackend()
+        await backend.image_disk_cost("base:latest")  # warm cache pre-upgrade
+        fake_docker.history_output["img_S1"] = b"N/A\n" * 5
+        fake_docker.history_output["committed"] = b"N/A\n" * 5
+        with capture_logs() as logs:
+            for i in range(20):
+                await backend.snapshot(
+                    "cid", f"tag:{i}", empty_floor_bytes=8192, flatten_if_unique_bytes_over=None
+                )
+        assert snapshot_telemetry.degraded_total("history_unparseable") >= 20
+        assert self._alarms(logs), "every new image unparseable for 20 snapshots yet no alarm"
+
+    def test_cache_hit_does_not_reset_a_streak(self) -> None:
+        """Only a fresh success of the SAME subject resets its streak."""
+        for _ in range(snapshot_telemetry.ALERT_STREAK - 1):
+            snapshot_telemetry.record_degraded("history_unparseable", subject="a")
+        snapshot_telemetry.record_measured("b", "history_unparseable")
+        assert snapshot_telemetry.degraded_streak("history_unparseable", "a") == (
+            snapshot_telemetry.ALERT_STREAK - 1
+        )
+        snapshot_telemetry.record_measured("a", "history_unparseable")
+        assert snapshot_telemetry.degraded_streak("history_unparseable", "a") == 0
+
+    def test_window_alarms_when_each_image_fails_only_once(self) -> None:
+        """Every NEW image degrades once (no per-image streak), interleaved with
+        successes of other images: the degraded-share window must alarm, once."""
+        with capture_logs() as logs:
+            for i in range(snapshot_telemetry.WINDOW * 3):
+                snapshot_telemetry.record_degraded("history_unparseable", subject=f"new{i}")
+                snapshot_telemetry.record_measured("parent", "history_unparseable")
+        alarms = self._alarms(logs)
+        assert len(alarms) == 1
+        assert alarms[0]["trigger"] == "window"
+
+    def test_occasional_failure_among_successes_does_not_alarm(self) -> None:
+        with capture_logs() as logs:
+            for i in range(snapshot_telemetry.WINDOW * 5):
+                if i % 5 == 0:
+                    snapshot_telemetry.record_degraded("history_unparseable", subject=f"x{i}")
+                else:
+                    snapshot_telemetry.record_measured(f"y{i}", "history_unparseable")
+        assert not self._alarms(logs)
+
+    def test_a_broken_metrics_sink_never_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Boom:
+            def labels(self, **_kw: Any) -> Any:
+                raise RuntimeError("sink exploded")
+
+        monkeypatch.setattr(snapshot_telemetry, "_DEGRADED", _Boom())
+        snapshot_telemetry.record_degraded("history_unparseable")
+        assert snapshot_telemetry.degraded_total("history_unparseable") == 1
 
 
 # ── env-keys scrub scope (the verified container-bricker guard) ──────────────
